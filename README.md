@@ -377,4 +377,5 @@ This project is licensed under the LGPL - see the plugin definition for details.
 
 ## Contact
 
+General Contact: RidgeRun Support <support@ridgerun.com>
 Maintainer: Frander Diaz <frander.diaz@ridgerun.com> 
