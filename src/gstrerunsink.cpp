@@ -1,22 +1,42 @@
+/*
+ * This file is part of GstRerunSink
+ * Copyright 2025 Ridgerun, LLC (http://www.ridgerun.com)
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Library General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Library General Public License for more details.
+ *
+ * You should have received a copy of the GNU Library General Public
+ * License along with this library; if not, write to the
+ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
+ * Boston, MA 02110-1301, USA.
+ */
+
 #include "gstrerunsink.hpp"
-#include <gst/video/video.h>
-#include <gst/gst.h>
-#include <gst/gstmemory.h>
-#include <gst/gstallocator.h>
-//#include <gst/pad.h> 
-#include <rerun.hpp>
-#include <rerun/components/image_format.hpp>
-#include <gst/video/navigation.h>
-#include <gst/video/videooverlay.h>
-#include <gst/video/colorbalance.h>
-/* Helper functions */
-#include <gst/video/gstvideometa.h>
-#include <gst/gstinfo.h>
 
 #include "gst/gstbuffer.h"
-#include "gst/gstutils.h"
 #include "gst/gstminiobject.h"
+#include "gst/gstutils.h"
 #include "gst/gstversion.h"
+#include <gst/gst.h>
+#include <gst/gstallocator.h>
+#include <gst/gstinfo.h>
+#include <gst/gstmemory.h>
+#include <gst/video/colorbalance.h>
+#include <gst/video/gstvideometa.h>
+#include <gst/video/navigation.h>
+#include <gst/video/video.h>
+#include <gst/video/videooverlay.h>
+#include <rerun.hpp>
+#include <rerun/archetypes/video_stream.hpp>
+#include <rerun/components/image_format.hpp>
+
 #include <vector> 
 
 #ifdef HAVE_NVMM_SUPPORT
@@ -25,13 +45,20 @@
 #include <nvbufsurface.h>
 #endif
 
+using namespace std::chrono;
+
 GST_DEBUG_CATEGORY_STATIC(gst_rerun_sink_debug);
 
 #define DEFAULT_GRPC_ADDRESS "127.0.0.1:9876"
+#define DEFAULT_RECORDING_ID NULL
+#define DEFAULT_IMAGE_PATH NULL
+#define DEFAULT_SPAWN_VIEWER TRUE
+#define DEFAULT_OUTPUT_FILE NULL
+#define DEFAULT_VIDEO_PATH NULL
 
 #define FORMAT_CAPS GST_VIDEO_CAPS_MAKE("{ NV12, I420, RGB, GRAY8, RGBA }")
 #define FORMAT_NVMM_CAPS GST_VIDEO_CAPS_MAKE_WITH_FEATURES("memory:NVMM", "{NV12}")
-#define ENCODED_CAPS GST_VIDEO_CAPS_MAKE("video/x-h264, stream-format=(string){ avc, byte-stream }; video/x-h265, stream-format=(string){ hvc1, hev1, byte-stream }")
+#define ENCODED_CAPS "video/x-h264, stream-format=(string)byte-stream; video/x-h265, stream-format=(string){ hvc1, hev1, byte-stream }"
 
 #ifdef HAVE_NVMM_SUPPORT
 #define RERUN_SINK_CAPS FORMAT_CAPS ";" FORMAT_NVMM_CAPS ";" ENCODED_CAPS
@@ -39,7 +66,6 @@ GST_DEBUG_CATEGORY_STATIC(gst_rerun_sink_debug);
 #define RERUN_SINK_CAPS FORMAT_CAPS ";" ENCODED_CAPS
 #endif
 
-// Property enum
 enum {
   PROP_0,
   PROP_RECORDING_ID,
@@ -47,19 +73,36 @@ enum {
   PROP_SPAWN_VIEWER,
   PROP_OUTPUT_FILE,
   PROP_GRPC_ADDRESS,
+  PROP_VIDEO_PATH,
 };
 
 #define GST_CAT_DEFAULT gst_rerun_sink_debug
 
-#define GST_VIDEO_FORMAT_RGB GST_VIDEO_FORMAT_RGB
-#define GST_VIDEO_FORMAT_RGBA GST_VIDEO_FORMAT_RGBA
-#define GST_VIDEO_FORMAT_GRAY8 GST_VIDEO_FORMAT_GRAY8
-#define GST_VIDEO_FORMAT_NV12 GST_VIDEO_FORMAT_NV12
-#define GST_VIDEO_FORMAT_I420 GST_VIDEO_FORMAT_I420
+typedef struct _GstRerunSinkPrivate {
+  rerun::RecordingStream* rec_stream;
+  gboolean rerun_initialized;
+
+  gchar *recording_id;
+  gchar *image_path;
+  gchar *video_path;
+
+  gboolean spawn_viewer;      // Whether to spawn a Rerun viewer (only if output_file and grpc_address are not set)
+  gchar *output_file;         // Path to output .rrd file (if set, saves to disk)
+  gchar *grpc_address;        // gRPC connection string (if set to non-default, connects via gRPC)
+
+} GstRerunSinkPrivate;
+
+typedef struct _GstRerunSink {
+  GstVideoSink      parent_instance;
+  GstRerunSinkPrivate *priv;
+} GstRerunSink;
+
+struct _GstRerunSinkClass {
+  GstVideoSinkClass parent_class;
+};
 
 G_DEFINE_TYPE_WITH_PRIVATE(GstRerunSink, gst_rerun_sink, GST_TYPE_VIDEO_SINK)
 
-// Forward declarations for helper functions
 static rerun::archetypes::Image create_image_from_format(
     const std::vector<std::uint8_t>& raw_data,
     GstVideoFormat format,
@@ -88,13 +131,7 @@ static GstFlowReturn process_regular_buffer(
     const GstVideoInfo* info,
     rerun::archetypes::Image& image);
 
-// Main render function
-static GstFlowReturn gst_rerun_sink_render(GstBaseSink *sink, GstBuffer *buffer) {  
-#ifdef HAVE_NVMM_SUPPORT
-    // Initialize CUDA context (required for NVMM handling)
-    cudaFree(0);
-#endif
-
+static GstFlowReturn gst_rerun_sink_render(GstBaseSink *sink, GstBuffer *buffer) {
     GstRerunSink* self = GST_RERUN_SINK(sink);
     GstRerunSinkPrivate* priv = (GstRerunSinkPrivate*)gst_rerun_sink_get_instance_private(self);
 
@@ -135,7 +172,6 @@ static GstFlowReturn gst_rerun_sink_render(GstBaseSink *sink, GstBuffer *buffer)
         return ret;
     }
 
-    // Log to Rerun if initialized
     if (priv->rerun_initialized && priv->rec_stream && priv->image_path) {
         priv->rec_stream->log(priv->image_path, image);
     } else if (!priv->image_path) {
@@ -163,7 +199,8 @@ static GstFlowReturn process_encoded_video(
     
     GstRerunSinkPrivate* priv = (GstRerunSinkPrivate*)gst_rerun_sink_get_instance_private(self);
     
-    if (!priv->rerun_initialized || !priv->rec_stream || !priv->image_path) {
+    if (!priv->rerun_initialized || !priv->rec_stream || !priv->video_path) {
+        GST_WARNING_OBJECT(self, "video-path property not set, skipping frame logging");
         return GST_FLOW_OK;
     }
     
@@ -194,17 +231,36 @@ static GstFlowReturn process_encoded_video(
         codec_data_str = gst_structure_get_string(structure, "stream-format");
         GST_INFO_OBJECT(self, "H.265 stream detected: %dx%d, stream-format: %s", 
                         width, height, codec_data_str ? codec_data_str : "unknown");
-    }
-    
-    // TODO: When Rerun supports encoded video, implement logging here
-    // For now, this is a no-op but maintains the pipeline flow
-    GST_DEBUG_OBJECT(self, "Encoded video support coming soon in Rerun. Buffer size: %" G_GSIZE_FORMAT, 
+        GST_DEBUG_OBJECT(self, "Encoded H.265 video support coming soon in Rerun. Buffer size: %" G_GSIZE_FORMAT, 
                      gst_buffer_get_size(buffer));
+
+        return GST_FLOW_OK;
+    }
+
+    GstMapInfo map;
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        GST_ERROR_OBJECT(self, "Failed to map buffer for reading");
+        return GST_FLOW_ERROR;
+    }
+
+    auto timestamp = time_point<steady_clock, nanoseconds>(nanoseconds(GST_BUFFER_DTS(buffer)));
+    priv->rec_stream->set_time_timestamp("time", timestamp);
+
+    static bool codec_sent = false;
+    if (!codec_sent) {
+        auto video_stream = rerun::archetypes::VideoStream().with_codec(rerun::components::VideoCodec::H264);
+        priv->rec_stream->log_static(priv->video_path, video_stream);
+        codec_sent = true;
+    }
+
+    auto byte_collection = rerun::Collection<uint8_t>::borrow(map.data, map.size);
+    auto sample = rerun::components::VideoSample(std::move(byte_collection));
+    auto video_stream = rerun::archetypes::VideoStream().with_sample(sample);
+
+    priv->rec_stream->log(priv->video_path, video_stream);
     
-    // Future implementation would look something like:
-    // auto encoded_frame = rerun::archetypes::EncodedVideo(...)
-    // priv->rec_stream->log(priv->image_path, encoded_frame);
-    
+    gst_buffer_unmap(buffer, &map);
+
     return GST_FLOW_OK;
 }
 
@@ -233,7 +289,6 @@ static gboolean is_nvmm_memory(GstBuffer* buffer) {
     return is_nvmm;
 }
 
-// Process NVMM buffer
 static GstFlowReturn process_nvmm_buffer(
     GstRerunSink* self,
     GstBuffer* buffer,
@@ -375,7 +430,6 @@ static GstFlowReturn process_regular_buffer(
     return GST_FLOW_OK;
 }
 
-// Helper function to create Rerun image from various formats
 static rerun::archetypes::Image create_image_from_format(
     const std::vector<std::uint8_t>& raw_data,
     GstVideoFormat format,
@@ -396,7 +450,7 @@ static rerun::archetypes::Image create_image_from_format(
             );
 
         case GST_VIDEO_FORMAT_GRAY8:
-            return rerun::archetypes::Image::from_greyscale8(
+            return rerun::archetypes::Image::from_grayscale8(
                 raw_data,
                 rerun::WidthHeight(width, height)
             );
@@ -421,7 +475,6 @@ static rerun::archetypes::Image create_image_from_format(
     }
 }
 
-// Caps negotiation
 static gboolean gst_rerun_sink_set_caps(GstBaseSink *sink, GstCaps *caps) {
     GstRerunSink *self = GST_RERUN_SINK(sink);
     
@@ -432,7 +485,6 @@ static gboolean gst_rerun_sink_set_caps(GstBaseSink *sink, GstCaps *caps) {
     return GST_BASE_SINK_CLASS(gst_rerun_sink_parent_class)->set_caps(sink, caps);
 }
 
-// Property setters
 static void gst_rerun_sink_set_property(GObject *object, guint prop_id,
                                         const GValue *value, GParamSpec *pspec) {
     GstRerunSink *self = GST_RERUN_SINK(object);
@@ -451,6 +503,12 @@ static void gst_rerun_sink_set_property(GObject *object, guint prop_id,
             GST_INFO_OBJECT(self, "Set image-path: %s", priv->image_path);
             break;
             
+        case PROP_VIDEO_PATH:
+            g_free(priv->video_path);
+            priv->video_path = g_value_dup_string(value);
+            GST_INFO_OBJECT(self, "Set video-path: %s", priv->video_path);
+            break;
+
         case PROP_SPAWN_VIEWER:
             priv->spawn_viewer = g_value_get_boolean(value);
             GST_INFO_OBJECT(self, "Set spawn-viewer: %s", priv->spawn_viewer ? "true" : "false");
@@ -474,7 +532,6 @@ static void gst_rerun_sink_set_property(GObject *object, guint prop_id,
     }
 }
 
-// Property getters
 static void gst_rerun_sink_get_property(GObject *object, guint prop_id,
                                         GValue *value, GParamSpec *pspec) {
     GstRerunSink *self = GST_RERUN_SINK(object);
@@ -489,6 +546,10 @@ static void gst_rerun_sink_get_property(GObject *object, guint prop_id,
             g_value_set_string(value, priv->image_path);
             break;
             
+        case PROP_VIDEO_PATH:
+            g_value_set_string(value, priv->video_path);
+            break;
+
         case PROP_SPAWN_VIEWER:
             g_value_set_boolean(value, priv->spawn_viewer);
             break;
@@ -507,31 +568,28 @@ static void gst_rerun_sink_get_property(GObject *object, guint prop_id,
     }
 }
 
-// Initialize instance
 static void gst_rerun_sink_init(GstRerunSink *self) {
     GstRerunSinkPrivate* priv = (GstRerunSinkPrivate*)gst_rerun_sink_get_instance_private(self);
 
     priv->rec_stream = nullptr;
     priv->rerun_initialized = FALSE;
-    priv->recording_id = NULL;
-    priv->image_path = NULL;
-    
-    // Initialize output properties with defaults
-    priv->spawn_viewer = TRUE;  // Default to spawning viewer for backward compatibility
-    priv->output_file = NULL;
-    priv->grpc_address = g_strdup(DEFAULT_GRPC_ADDRESS);  // Default gRPC address
+    priv->recording_id = DEFAULT_RECORDING_ID;
+    priv->image_path = DEFAULT_IMAGE_PATH;
+    priv->video_path = DEFAULT_VIDEO_PATH;
+
+    priv->spawn_viewer = DEFAULT_SPAWN_VIEWER;
+    priv->output_file = DEFAULT_OUTPUT_FILE;
+    priv->grpc_address = g_strdup(DEFAULT_GRPC_ADDRESS);
 }
 
-// Start the sink
 static gboolean gst_rerun_sink_start(GstBaseSink *sink) {
     GstRerunSink *self = GST_RERUN_SINK(sink);
     GstRerunSinkPrivate *priv = (GstRerunSinkPrivate *)gst_rerun_sink_get_instance_private(self);
 
     if (!priv->rerun_initialized) {
-        const char* rec_id = priv->recording_id ? priv->recording_id : "my_gst_element";
+        const char* rec_id = priv->recording_id ? priv->recording_id : "gst-rerun";
         priv->rec_stream = new rerun::RecordingStream(rec_id);
 
-        
         // Check for conflicting options
         gboolean has_output_file = (priv->output_file != NULL);
         gboolean has_custom_grpc = (priv->grpc_address && 
@@ -547,9 +605,7 @@ static gboolean gst_rerun_sink_start(GstBaseSink *sink) {
             return FALSE;
         }
         
-        // Determine output mode based on properties
         if (has_output_file) {
-            // Save to disk mode
             GST_INFO_OBJECT(self, "Saving to disk: %s", priv->output_file);
             auto result = priv->rec_stream->save(priv->output_file);
             if (result.is_err()) {
@@ -559,7 +615,6 @@ static gboolean gst_rerun_sink_start(GstBaseSink *sink) {
                 return FALSE;
             }
         } else if (has_custom_grpc) {
-            // Connect to gRPC mode
             GST_INFO_OBJECT(self, "Connecting to gRPC at: %s", priv->grpc_address);
             auto result = priv->rec_stream->connect_grpc(priv->grpc_address);
             if (result.is_err()) {
@@ -569,14 +624,20 @@ static gboolean gst_rerun_sink_start(GstBaseSink *sink) {
                 return FALSE;
             }
         } else if (priv->spawn_viewer) {
-            // Spawn viewer mode
             GST_INFO_OBJECT(self, "Spawning Rerun viewer");
-            priv->rec_stream->spawn();
+            rerun::Error err = priv->rec_stream->spawn();
+            if (err.is_err()) {
+                GST_ERROR_OBJECT(self, "Error spawning Rerun viewer");
+                return FALSE;
+            }
         } else {
-            // No output method specified
             GST_WARNING_OBJECT(self, "No output method enabled: spawn-viewer is false and no output-file or custom grpc-address specified");
             // This is valid - user might just want to create recording without output
         }
+        #ifdef HAVE_NVMM_SUPPORT
+            // Initialize CUDA context (required for NVMM handling)
+            cudaFree(0);
+        #endif
 
         priv->rerun_initialized = TRUE;
         GST_INFO_OBJECT(self, "Initialized Rerun with recording ID: %s", rec_id);
@@ -585,7 +646,6 @@ static gboolean gst_rerun_sink_start(GstBaseSink *sink) {
     return TRUE;
 }
 
-// Stop the sink
 static gboolean gst_rerun_sink_stop(GstBaseSink *sink) {
     GstRerunSink *self = GST_RERUN_SINK(sink);
     GstRerunSinkPrivate *priv = (GstRerunSinkPrivate *)gst_rerun_sink_get_instance_private(self);
@@ -600,7 +660,6 @@ static gboolean gst_rerun_sink_stop(GstBaseSink *sink) {
     return TRUE;
 }
 
-// Dispose resources
 static void gst_rerun_sink_dispose(GObject *object) {
     GstRerunSink *self = GST_RERUN_SINK(object);
     GstRerunSinkPrivate *priv = (GstRerunSinkPrivate *)gst_rerun_sink_get_instance_private(self);
@@ -613,27 +672,23 @@ static void gst_rerun_sink_dispose(GObject *object) {
     G_OBJECT_CLASS(gst_rerun_sink_parent_class)->dispose(object);
 }
 
-// Plugin initialization
 static gboolean plugin_init(GstPlugin *plugin) {
     GST_DEBUG_CATEGORY_INIT(gst_rerun_sink_debug, "rerunsink", 0, "Rerun sink");
     
     return gst_element_register(plugin, "rerunsink", GST_RANK_NONE, GST_TYPE_RERUN_SINK);
 }
 
-// Class initialization
 static void gst_rerun_sink_class_init(GstRerunSinkClass *klass) {
     GObjectClass *gobject_class = G_OBJECT_CLASS(klass);
     GstElementClass *element_class = GST_ELEMENT_CLASS(klass);
     GstBaseSinkClass *basesink_class = GST_BASE_SINK_CLASS(klass);
 
-    // Set metadata
     gst_element_class_set_static_metadata(element_class,
         "RerunSink", 
         "Sink/Video", 
         "Video sink that logs frames to Rerun for visualization",
-        "Frander Diaz <frander.diaz@ridgerun.com>");
+        "Frander Diaz <support@ridgerun.com>");
 
-    // Install properties
     gobject_class->set_property = gst_rerun_sink_set_property;
     gobject_class->get_property = gst_rerun_sink_get_property;
     gobject_class->dispose = gst_rerun_sink_dispose;
@@ -641,34 +696,39 @@ static void gst_rerun_sink_class_init(GstRerunSinkClass *klass) {
     g_object_class_install_property(gobject_class, PROP_RECORDING_ID,
         g_param_spec_string("recording-id", "Recording ID",
                             "Rerun recording/session identifier",
-                            NULL, 
+                            DEFAULT_RECORDING_ID,
                             (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
                         
     g_object_class_install_property(gobject_class, PROP_IMAGE_PATH,
         g_param_spec_string("image-path", "Image Path",
                             "Entity path for logging images (e.g. 'camera/front/frame')",
-                            NULL, 
+                            DEFAULT_IMAGE_PATH,
                             (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-    
+
+    g_object_class_install_property(gobject_class, PROP_VIDEO_PATH,
+        g_param_spec_string("video-path", "Video Path",
+                            "Entity path for logging video (e.g. 'camera/front/frame')",
+                            DEFAULT_VIDEO_PATH,
+                            (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
     g_object_class_install_property(gobject_class, PROP_SPAWN_VIEWER,
         g_param_spec_boolean("spawn-viewer", "Spawn Viewer",
                              "Spawn a Rerun viewer instance (ignored if output-file is set or grpc-address is non-default)",
-                             TRUE, 
+                             DEFAULT_SPAWN_VIEWER,
                              (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
     
     g_object_class_install_property(gobject_class, PROP_OUTPUT_FILE,
         g_param_spec_string("output-file", "Output File",
                             "Path to output .rrd file (if set, saves to disk instead of spawning viewer)",
-                            NULL, 
+                            DEFAULT_OUTPUT_FILE,
                             (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
     
     g_object_class_install_property(gobject_class, PROP_GRPC_ADDRESS,
         g_param_spec_string("grpc-address", "gRPC Address",
                             "gRPC server address (if non-default, connects via gRPC instead of spawning viewer)",
-                            DEFAULT_GRPC_ADDRESS, 
+                            DEFAULT_GRPC_ADDRESS,
                             (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
-    // Set virtual function pointers
     basesink_class->start = GST_DEBUG_FUNCPTR(gst_rerun_sink_start);
     basesink_class->stop = GST_DEBUG_FUNCPTR(gst_rerun_sink_stop);
     basesink_class->render = GST_DEBUG_FUNCPTR(gst_rerun_sink_render);
@@ -678,7 +738,6 @@ static void gst_rerun_sink_class_init(GstRerunSinkClass *klass) {
         gst_pad_template_new("sink", GST_PAD_SINK, GST_PAD_ALWAYS, gst_caps_from_string(RERUN_SINK_CAPS)));
 }
 
-// Plugin definition
 GST_PLUGIN_DEFINE(
     GST_VERSION_MAJOR,
     GST_VERSION_MINOR,

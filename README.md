@@ -6,7 +6,7 @@ A high-performance GStreamer video sink element that logs frames into [Rerun](ht
 
 - **Multiple Format Support**: 
   - Raw formats: NV12, I420, RGB, GRAY8, RGBA
-  - Encoded formats: H.264, H.265 (structure in place, logging coming soon)
+  - Encoded formats: H.264 (H.265 comming soon)
 - **NVIDIA NVMM Support** (optional): Zero-copy processing for GPU memory buffers
 - **Efficient Processing**: Optimized buffer handling for both CPU and GPU memory
 - **Flexible Output Options**:
@@ -33,26 +33,6 @@ The official user documentation is held at [RidgeRun's DevelopersWiki](https://d
 - NVIDIA DeepStream SDK 6.3 (installed at `/opt/nvidia/deepstream/deepstream-6.3`)
 
 ## Building
-
-### Quick Start
-
-Use the provided build script for easy compilation:
-
-```bash
-# Basic build (CPU support only)
-./build.sh
-
-# Build with NVMM support
-./build.sh --nvmm
-
-# Clean build with installation
-./build.sh --clean --install
-
-# Debug build with verbose output
-./build.sh --debug --verbose
-```
-
-### Manual Build
 
 #### Without NVMM Support
 ```bash
@@ -160,19 +140,14 @@ gst-launch-1.0 filesrc location=video.mp4 ! \
     grpc-address="grpc://0.0.0.5:9876"
 ```
 
-### Encoded Video Examples (Future Support)
+### Encoded Video Examples
 
-These pipelines demonstrate H.264/H.265 support (currently no-op, logging coming soon):
+These pipelines demonstrate H.264 support:
 
 ```bash
-# H.264 encoded stream (structure ready, logging coming soon)
+# H.264 encoded stream
 gst-launch-1.0 videotestsrc ! x264enc ! h264parse ! \
     rerunsink recording-id="h264-test" image-path="video/encoded"
-
-# H.265 encoded stream from file
-gst-launch-1.0 filesrc location=video.mp4 ! \
-    qtdemux ! h265parse ! \
-    rerunsink recording-id="h265-test" image-path="video/encoded"
 
 # Camera to H.264 with tee for preview and recording
 gst-launch-1.0 v4l2src ! videoconvert ! \
@@ -181,7 +156,7 @@ gst-launch-1.0 v4l2src ! videoconvert ! \
     t. ! queue ! mp4mux ! filesink location=output.mp4
 ```
 
-**Note**: H.264/H.265 logging is not yet implemented in Rerun. The sink accepts these formats and processes them as a no-op to maintain pipeline compatibility. Full support will be enabled when Rerun adds encoded video capabilities.
+**Note**: H.265 logging is not yet implemented in Rerun. The sink accepts these format and processes it as a no-op to maintain pipeline compatibility.
 
 ### Properties
 
@@ -267,9 +242,8 @@ The plugin follows a clean, modular architecture:
 - **NV12**: YUV 4:2:0 semi-planar
 - **I420**: YUV 4:2:0 planar
 
-### Encoded Video Formats (Structure Ready)
-- **H.264**: AVC/byte-stream format (logging coming soon)
-- **H.265**: HEVC/byte-stream format (logging coming soon)
+### Encoded Video Formats
+- **H.264**: byte-stream format
 
 ### GPU Memory Formats (NVMM)
 - **NV12**: Hardware-accelerated YUV 4:2:0

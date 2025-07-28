@@ -6,17 +6,24 @@ option(WITH_NVMM_SUPPORT "Enable NVMM (NVIDIA Multi Media) buffer support" OFF)
 
 # ==================== DEPENDENCIES ====================
 find_package(PkgConfig REQUIRED)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Rerun SDK
 include(FetchContent)
 FetchContent_Declare(rerun_sdk URL
-    https://github.com/rerun-io/rerun/releases/latest/download/rerun_cpp_sdk.zip)
-FetchContent_MakeAvailable(rerun_sdk)
+    https://github.com/rerun-io/rerun/releases/download/0.24.0/rerun_cpp_sdk.zip)
+FetchContent_Populate(rerun_sdk)
 
-#set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH}:/usr/local/lib/cmake/rerun_sdk/")
-#find_package(rerun_sdk REQUIRED)
+execute_process(
+    COMMAND ${CMAKE_COMMAND} -E echo "Patching rerun_sdk..."
+)
 
-# GStreamer components
+execute_process(
+    COMMAND patch -p1 -i ${CMAKE_CURRENT_SOURCE_DIR}/rerun_sdk.patch
+    WORKING_DIRECTORY ${rerun_sdk_SOURCE_DIR}
+)
+
+add_subdirectory(${rerun_sdk_SOURCE_DIR} ${rerun_sdk_BINARY_DIR})
+
 pkg_check_modules(GST REQUIRED
     gstreamer-1.0
     gstreamer-base-1.0
@@ -24,8 +31,6 @@ pkg_check_modules(GST REQUIRED
     gstreamer-check-1.0
 )
 
-# Check framework for tests
-#pkg_check_modules(CHECK REQUIRED check)
 
 # ==================== NVIDIA DEPENDENCIES (OPTIONAL) ====================
 if(WITH_NVMM_SUPPORT)
