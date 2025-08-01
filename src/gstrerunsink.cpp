@@ -90,6 +90,8 @@ typedef struct _GstRerunSinkPrivate {
   gchar *output_file;         // Path to output .rrd file (if set, saves to disk)
   gchar *grpc_address;        // gRPC connection string (if set to non-default, connects via gRPC)
 
+  gboolean codec_sent;
+
 } GstRerunSinkPrivate;
 
 typedef struct _GstRerunSink {
@@ -223,18 +225,24 @@ static GstFlowReturn process_encoded_video(
     }
     
     const gchar* codec_data_str = NULL;
+    rerun::components::VideoCodec codec;
     if (g_strcmp0(format_name, "video/x-h264") == 0) {
         codec_data_str = gst_structure_get_string(structure, "stream-format");
         GST_INFO_OBJECT(self, "H.264 stream detected: %dx%d, stream-format: %s", 
                         width, height, codec_data_str ? codec_data_str : "unknown");
+        codec = rerun::components::VideoCodec::H264;
     } else if (g_strcmp0(format_name, "video/x-h265") == 0) {
         codec_data_str = gst_structure_get_string(structure, "stream-format");
         GST_INFO_OBJECT(self, "H.265 stream detected: %dx%d, stream-format: %s", 
                         width, height, codec_data_str ? codec_data_str : "unknown");
-        GST_DEBUG_OBJECT(self, "Encoded H.265 video support coming soon in Rerun. Buffer size: %" G_GSIZE_FORMAT, 
-                     gst_buffer_get_size(buffer));
+        codec = rerun::components::VideoCodec::H265;
+    }
 
-        return GST_FLOW_OK;
+
+    if (!priv->codec_sent) {
+        auto video_stream = rerun::archetypes::VideoStream().with_codec(codec);
+        priv->rec_stream->log_static(priv->video_path, video_stream);
+        priv->codec_sent = true;
     }
 
     GstMapInfo map;
@@ -246,12 +254,6 @@ static GstFlowReturn process_encoded_video(
     auto timestamp = time_point<steady_clock, nanoseconds>(nanoseconds(GST_BUFFER_DTS(buffer)));
     priv->rec_stream->set_time_timestamp("time", timestamp);
 
-    static bool codec_sent = false;
-    if (!codec_sent) {
-        auto video_stream = rerun::archetypes::VideoStream().with_codec(rerun::components::VideoCodec::H264);
-        priv->rec_stream->log_static(priv->video_path, video_stream);
-        codec_sent = true;
-    }
 
     auto byte_collection = rerun::Collection<uint8_t>::borrow(map.data, map.size);
     auto sample = rerun::components::VideoSample(std::move(byte_collection));
@@ -580,6 +582,8 @@ static void gst_rerun_sink_init(GstRerunSink *self) {
     priv->spawn_viewer = DEFAULT_SPAWN_VIEWER;
     priv->output_file = DEFAULT_OUTPUT_FILE;
     priv->grpc_address = g_strdup(DEFAULT_GRPC_ADDRESS);
+
+    priv->codec_sent = FALSE;
 }
 
 static gboolean gst_rerun_sink_start(GstBaseSink *sink) {
@@ -639,6 +643,7 @@ static gboolean gst_rerun_sink_start(GstBaseSink *sink) {
             cudaFree(0);
         #endif
 
+        priv->codec_sent = FALSE;
         priv->rerun_initialized = TRUE;
         GST_INFO_OBJECT(self, "Initialized Rerun with recording ID: %s", rec_id);
     }
@@ -654,6 +659,7 @@ static gboolean gst_rerun_sink_stop(GstBaseSink *sink) {
         delete priv->rec_stream;
         priv->rec_stream = nullptr;
         priv->rerun_initialized = FALSE;
+        priv->codec_sent = FALSE;
         GST_INFO_OBJECT(self, "Stopped Rerun recording");
     }
 
